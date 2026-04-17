@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 from PyQt6.QtCore import QSignalBlocker, QTimer, Qt, QUrl
@@ -32,11 +34,15 @@ from PyQt6.QtWidgets import (
 
 from app.analysis.metrics import build_summary_metrics, magnitude_db
 from app.analysis.mixed_mode import PAIRING_OPTIONS, single_ended_to_mixed_mode
-from app.analysis.sparam_loader import load_touchstone_dataset
-from app.analysis.tdr import compute_differential_tdr
 from app.models.loaded_dataset import FrequencyMarkerRow, LoadedDataset
 from app.plots.mpl_canvas import PlotCanvas
-from app.services.update_checker import GitHubReleaseChecker, UpdateCheckError
+from app.services.update_checker import (
+    GitHubReleaseChecker,
+    UpdateCheckError,
+    UpdateInstallError,
+    can_self_update,
+    prepare_windows_self_update,
+)
 from app.ui.widgets.file_list_widget import FileListWidget
 from app.ui.widgets.marker_readout import MarkerReadoutWidget
 from app.version import __version__
@@ -62,6 +68,28 @@ def mixed_mode_trace_names() -> list[str]:
 
 
 ALL_TRACE_NAMES = single_ended_trace_names() + mixed_mode_trace_names()
+
+_SPARAM_LOADER_MODULE: ModuleType | None = None
+_TDR_MODULE: ModuleType | None = None
+
+
+def load_touchstone_dataset_lazy(file_path: str) -> LoadedDataset:
+    global _SPARAM_LOADER_MODULE
+    if _SPARAM_LOADER_MODULE is None:
+        _SPARAM_LOADER_MODULE = importlib.import_module("app.analysis.sparam_loader")
+    return _SPARAM_LOADER_MODULE.load_touchstone_dataset(file_path=file_path)
+
+
+def compute_differential_tdr_lazy(*, frequency_hz, sdd11, reference_impedance_ohms, oversample):
+    global _TDR_MODULE
+    if _TDR_MODULE is None:
+        _TDR_MODULE = importlib.import_module("app.analysis.tdr")
+    return _TDR_MODULE.compute_differential_tdr(
+        frequency_hz=frequency_hz,
+        sdd11=sdd11,
+        reference_impedance_ohms=reference_impedance_ohms,
+        oversample=oversample,
+    )
 
 
 class MainWindow(QMainWindow):
@@ -260,7 +288,7 @@ class MainWindow(QMainWindow):
             if file_path in self.datasets:
                 continue
             try:
-                dataset = load_touchstone_dataset(file_path=file_path)
+                dataset = load_touchstone_dataset_lazy(file_path=file_path)
             except Exception as exc:  # pragma: no cover
                 QMessageBox.critical(self, "Load Error", f"Could not load {file_path}:\n{exc}")
                 continue
@@ -313,7 +341,7 @@ class MainWindow(QMainWindow):
             mixed_mode = single_ended_to_mixed_mode(dataset.raw_s_parameters, port_order=port_order)
             sdd11 = mixed_mode[:, 0, 0]
             sdd21 = mixed_mode[:, 1, 0]
-            tdr_result = compute_differential_tdr(
+            tdr_result = compute_differential_tdr_lazy(
                 frequency_hz=dataset.frequency_hz,
                 sdd11=sdd11,
                 reference_impedance_ohms=self.reference_impedance.value(),
@@ -328,6 +356,10 @@ class MainWindow(QMainWindow):
 
     def _apply_frequency_limit_from_file(self) -> None:
         if not self.datasets:
+            self.freq_limit_ghz.blockSignals(True)
+            self.freq_limit_ghz.setValue(30.0)
+            self.freq_limit_ghz.blockSignals(False)
+            self.refresh_plots()
             return
         max_stop_ghz = max(float(dataset.frequency_hz[-1] / 1e9) for dataset in self.datasets.values())
         self.freq_limit_ghz.blockSignals(True)
@@ -537,17 +569,43 @@ class MainWindow(QMainWindow):
             return
 
         if info.is_update_available:
-            result = QMessageBox.question(
-                self,
-                "Update Available",
-                (
-                    f"Installed version: {info.current_version}\n"
-                    f"Latest release: {info.latest_version}\n\n"
-                    f"Open the release page?\n{info.html_url}"
-                ),
+            message_box = QMessageBox(self)
+            message_box.setWindowTitle("Update Available")
+            message_box.setIcon(QMessageBox.Icon.Information)
+            message_box.setText(
+                f"Installed version: {info.current_version}\n"
+                f"Latest release: {info.latest_version}"
             )
-            if result == QMessageBox.StandardButton.Yes:
+            message_box.setInformativeText("Choose how you want to get the update.")
+            install_button = None
+            if can_self_update() and info.asset_download_url:
+                install_button = message_box.addButton("Download and Install", QMessageBox.ButtonRole.AcceptRole)
+            open_button = message_box.addButton("Open Release Page", QMessageBox.ButtonRole.ActionRole)
+            cancel_button = message_box.addButton(QMessageBox.StandardButton.Cancel)
+            message_box.exec()
+
+            clicked = message_box.clickedButton()
+            if install_button is not None and clicked == install_button:
+                try:
+                    prepare_windows_self_update(info)
+                except UpdateInstallError as exc:
+                    QMessageBox.warning(self, "Automatic Update", str(exc))
+                    self.status_label.setText("Automatic update could not be started.")
+                    return
+                self.status_label.setText(f"Installing update {info.latest_version}...")
+                QMessageBox.information(
+                    self,
+                    "Installing Update",
+                    "The update was downloaded. The app will now close and restart after replacement.",
+                )
+                self.close()
+                return
+
+            if clicked == open_button:
                 QDesktopServices.openUrl(QUrl(info.html_url))
+            if clicked == cancel_button:
+                self.status_label.setText(f"Update available: {info.latest_version}")
+                return
             self.status_label.setText(f"Update available: {info.latest_version}")
             return
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import interpolate, signal
 
 
 @dataclass(slots=True)
@@ -12,17 +11,12 @@ class TdrResult:
     impedance_ohms: np.ndarray
 
 
-WINDOW_BUILDERS = {
-    "rectangular": None,
-    "hann": signal.windows.hann,
-    "kaiser": lambda size: signal.windows.kaiser(size, beta=6.0),
-}
-
-
 def _ensure_uniform_frequency(
     frequency_hz: np.ndarray,
     values: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
+    from scipy import interpolate
+
     diffs = np.diff(frequency_hz)
     if np.allclose(diffs, diffs[0], rtol=1e-6, atol=1e-3):
         return frequency_hz, values
@@ -39,13 +33,20 @@ def _ensure_uniform_frequency(
 
 
 def _apply_window(values: np.ndarray, window: str) -> np.ndarray:
-    if window not in WINDOW_BUILDERS:
-        raise ValueError(f"Unsupported window '{window}'.")
-
-    builder = WINDOW_BUILDERS[window]
-    if builder is None:
+    if window == "rectangular":
         return values
-    return values * builder(values.size)
+    if window == "hann":
+        from scipy import signal
+
+        return values * signal.windows.hann(values.size)
+    if window == "kaiser":
+        from scipy import signal
+
+        return values * signal.windows.kaiser(values.size, beta=6.0)
+
+    if window not in {"rectangular", "hann", "kaiser"}:
+        raise ValueError(f"Unsupported window '{window}'.")
+    return values
 
 
 def compute_differential_tdr(

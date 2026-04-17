@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import skrf as rf
-
 from app.models.loaded_dataset import LoadedDataset
 
 
 def load_touchstone_dataset(
     file_path: str,
 ) -> LoadedDataset:
+    import skrf as rf
+
     network = rf.Network(file_path)
     if network.nports != 4:
         raise ValueError(f"{file_path} is not a 4-port Touchstone file.")
