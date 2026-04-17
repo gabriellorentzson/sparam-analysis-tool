@@ -218,16 +218,13 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
 
 
 def launch_prepared_update(prepared_update: PreparedUpdate) -> None:
-    creation_flags = 0
-    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        creation_flags |= subprocess.CREATE_NEW_PROCESS_GROUP
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        creation_flags |= subprocess.DETACHED_PROCESS
-
+    powershell_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    if not os.path.exists(powershell_exe):
+        powershell_exe = "powershell.exe"
     try:
         subprocess.Popen(
             [
-                "powershell",
+                powershell_exe,
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
@@ -239,7 +236,7 @@ def launch_prepared_update(prepared_update: PreparedUpdate) -> None:
                 str(prepared_update.parent_pid),
                 prepared_update.log_path,
             ],
-            creationflags=creation_flags,
+            close_fds=True,
         )
     except OSError as exc:
         raise UpdateInstallError(f"Could not launch the update helper: {exc}") from exc
