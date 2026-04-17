@@ -5,7 +5,7 @@ from pathlib import Path
 from types import ModuleType
 
 import numpy as np
-from PyQt6.QtCore import QSignalBlocker, QTimer, Qt, QUrl
+from PyQt6.QtCore import QObject, QSignalBlocker, QThread, QTimer, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -38,9 +39,11 @@ from app.models.loaded_dataset import FrequencyMarkerRow, LoadedDataset
 from app.plots.mpl_canvas import PlotCanvas
 from app.services.update_checker import (
     GitHubReleaseChecker,
+    PreparedUpdate,
     UpdateCheckError,
     UpdateInstallError,
     can_self_update,
+    launch_prepared_update,
     prepare_windows_self_update,
 )
 from app.ui.widgets.file_list_widget import FileListWidget
@@ -92,6 +95,23 @@ def compute_differential_tdr_lazy(*, frequency_hz, sdd11, reference_impedance_oh
     )
 
 
+class UpdateInstallWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, update_info, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.update_info = update_info
+
+    def run(self) -> None:
+        try:
+            prepared_update = prepare_windows_self_update(self.update_info)
+        except UpdateInstallError as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(prepared_update)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -103,6 +123,10 @@ class MainWindow(QMainWindow):
         self._next_color_index = 0
         self._frequency_marker_ghz = 13.28
         self._tdr_marker_time_ns = 0.0
+        self._update_thread: QThread | None = None
+        self._update_worker: UpdateInstallWorker | None = None
+        self._update_progress_dialog: QProgressDialog | None = None
+        self._pending_prepared_update: PreparedUpdate | None = None
         self.update_checker = GitHubReleaseChecker(current_version=__version__)
 
         self.file_list = FileListWidget()
@@ -586,19 +610,7 @@ class MainWindow(QMainWindow):
 
             clicked = message_box.clickedButton()
             if install_button is not None and clicked == install_button:
-                try:
-                    prepare_windows_self_update(info)
-                except UpdateInstallError as exc:
-                    QMessageBox.warning(self, "Automatic Update", str(exc))
-                    self.status_label.setText("Automatic update could not be started.")
-                    return
-                self.status_label.setText(f"Installing update {info.latest_version}...")
-                QMessageBox.information(
-                    self,
-                    "Installing Update",
-                    "The update was downloaded. The app will now close and restart after replacement.",
-                )
-                self.close()
+                self._start_update_install(info)
                 return
 
             if clicked == open_button:
@@ -612,3 +624,60 @@ class MainWindow(QMainWindow):
         self.status_label.setText("App is up to date.")
         if not silent_if_current:
             QMessageBox.information(self, "Update Check", "You are already on the latest version.")
+
+    def _start_update_install(self, update_info) -> None:
+        if self._update_thread is not None:
+            return
+
+        self.status_label.setText(f"Downloading update {update_info.latest_version}...")
+        progress = QProgressDialog("Downloading and preparing update...", None, 0, 0, self)
+        progress.setWindowTitle("Installing Update")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        self._update_progress_dialog = progress
+
+        thread = QThread(self)
+        worker = UpdateInstallWorker(update_info)
+        worker.moveToThread(thread)
+        self._update_worker = worker
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_update_prepared)
+        worker.failed.connect(self._on_update_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_update_thread)
+        self._update_thread = thread
+        thread.start()
+
+    def _on_update_prepared(self, prepared_update: object) -> None:
+        if self._update_progress_dialog is not None:
+            self._update_progress_dialog.close()
+            self._update_progress_dialog = None
+
+        self._pending_prepared_update = prepared_update  # type: ignore[assignment]
+        self.status_label.setText("Update ready. Restarting...")
+        try:
+            launch_prepared_update(self._pending_prepared_update)
+        except UpdateInstallError as exc:
+            self._pending_prepared_update = None
+            QMessageBox.warning(self, "Automatic Update", str(exc))
+            self.status_label.setText("Automatic update could not be started.")
+            return
+        QTimer.singleShot(150, self.close)
+
+    def _on_update_failed(self, message: str) -> None:
+        if self._update_progress_dialog is not None:
+            self._update_progress_dialog.close()
+            self._update_progress_dialog = None
+        self.status_label.setText("Automatic update could not be started.")
+        QMessageBox.warning(self, "Automatic Update", message)
+
+    def _clear_update_thread(self) -> None:
+        self._update_thread = None
+        self._update_worker = None

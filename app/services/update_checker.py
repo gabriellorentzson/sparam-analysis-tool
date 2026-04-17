@@ -30,6 +30,14 @@ class UpdateInfo:
         return _normalize_version(self.latest_version) > _normalize_version(self.current_version)
 
 
+@dataclass(slots=True)
+class PreparedUpdate:
+    script_path: str
+    source_dir: str
+    target_dir: str
+    executable_name: str
+
+
 def _normalize_version(version: str) -> tuple[int, ...]:
     cleaned = version.strip().lstrip("v")
     parts = []
@@ -94,7 +102,7 @@ def can_self_update() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
-def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float = 60.0) -> None:
+def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float = 60.0) -> PreparedUpdate:
     if not can_self_update():
         raise UpdateInstallError("Automatic install is only available from the packaged app.")
     if not update_info.asset_download_url:
@@ -159,6 +167,21 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
     if hasattr(subprocess, "DETACHED_PROCESS"):
         creation_flags |= subprocess.DETACHED_PROCESS
 
+    return PreparedUpdate(
+        script_path=str(script_path),
+        source_dir=str(extracted_dir),
+        target_dir=str(install_dir),
+        executable_name=executable_name,
+    )
+
+
+def launch_prepared_update(prepared_update: PreparedUpdate) -> None:
+    creation_flags = 0
+    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        creation_flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+    if hasattr(subprocess, "DETACHED_PROCESS"):
+        creation_flags |= subprocess.DETACHED_PROCESS
+
     try:
         subprocess.Popen(
             [
@@ -167,10 +190,10 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                str(script_path),
-                str(extracted_dir),
-                str(install_dir),
-                executable_name,
+                prepared_update.script_path,
+                prepared_update.source_dir,
+                prepared_update.target_dir,
+                prepared_update.executable_name,
             ],
             creationflags=creation_flags,
         )
