@@ -6,6 +6,13 @@ import numpy as np
 
 
 @dataclass(slots=True)
+class FrequencyMarkerRow:
+    trace_name: str
+    frequency_ghz: float
+    magnitude_db: float
+
+
+@dataclass(slots=True)
 class MarkerReadout:
     axis_name: str
     x_label: str
@@ -20,9 +27,8 @@ class LoadedDataset:
     display_name: str
     enabled: bool
     frequency_hz: np.ndarray
-    sdd11: np.ndarray
-    sdd21: np.ndarray
-    sdd21_db: np.ndarray
+    raw_s_parameters: np.ndarray
+    mixed_mode_s_parameters: np.ndarray
     tdr_time_ns: np.ndarray
     tdr_impedance_ohms: np.ndarray
     metrics: dict[str, float | int | str]
