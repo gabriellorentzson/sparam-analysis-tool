@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparam-analysis-tool"
+version = "0.1.0"
+description = "Desktop S-parameter analysis tool for differential channel work"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Codex" }
+]
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "PyQt6>=6.7",
+  "scikit-rf>=1.2",
+  "scipy>=1.13",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyinstaller>=6.8",
+  "pytest>=8.3",
+]
+
+[project.scripts]
+sparam-tool = "app.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
