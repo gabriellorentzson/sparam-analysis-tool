@@ -104,6 +104,13 @@ def can_self_update() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def _resolve_extracted_payload_root(extracted_dir: Path) -> Path:
+    expected_folder = extracted_dir / "SParamAnalysisTool"
+    if expected_folder.is_dir():
+        return expected_folder
+    return extracted_dir
+
+
 def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float = 60.0) -> PreparedUpdate:
     if not can_self_update():
         raise UpdateInstallError("Automatic install is only available from the packaged app.")
@@ -133,6 +140,7 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
             archive.extractall(extracted_dir)
     except zipfile.BadZipFile as exc:
         raise UpdateInstallError("Downloaded update asset is not a valid zip file.") from exc
+    payload_root = _resolve_extracted_payload_root(extracted_dir)
 
     script_path = staging_root / "apply_update.ps1"
     script_contents = textwrap.dedent(
@@ -201,7 +209,7 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
 
     return PreparedUpdate(
         script_path=str(script_path),
-        source_dir=str(extracted_dir),
+        source_dir=str(payload_root),
         target_dir=str(install_dir),
         executable_path=executable_path,
         parent_pid=os.getpid(),
