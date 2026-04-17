@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sparam-analysis-tool"
-version = "0.1.9"
+version = "0.1.10"
 description = "Desktop S-parameter analysis tool for differential channel work"
 readme = "README.md"
 requires-python = ">=3.11"
