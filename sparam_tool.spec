@@ -2,7 +2,7 @@
 
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = collect_submodules("skrf")
+hiddenimports = collect_submodules("skrf") + collect_submodules("app.analysis")
 
 block_cipher = None
 
