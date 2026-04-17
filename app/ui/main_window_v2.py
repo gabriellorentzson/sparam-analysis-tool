@@ -55,6 +55,8 @@ PLOT_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
 MIXED_MODE_INDEX_LABELS = ("1", "2")
 MIXED_MODE_FAMILIES = ("SDD", "SDC", "SCD", "SCC")
 DEFAULT_TRACE = "SDD21"
+TRACE_LINESTYLES = ["-", "--", "-.", ":"]
+SPEED_OF_LIGHT_M_PER_S = 299_792_458.0
 
 
 def single_ended_trace_names() -> list[str]:
@@ -93,6 +95,13 @@ def compute_differential_tdr_lazy(*, frequency_hz, sdd11, reference_impedance_oh
         reference_impedance_ohms=reference_impedance_ohms,
         oversample=oversample,
     )
+
+
+def trace_linestyle(trace_name: str) -> str:
+    if trace_name == "SDD21":
+        return "-"
+    style_index = sum(ord(character) for character in trace_name) % len(TRACE_LINESTYLES)
+    return TRACE_LINESTYLES[style_index]
 
 
 class UpdateInstallWorker(QObject):
@@ -166,6 +175,17 @@ class MainWindow(QMainWindow):
         self.reference_impedance.setValue(100.0)
         self.reference_impedance.setSuffix(" Ohm")
 
+        self.show_distance_axis = QCheckBox("Show distance axis")
+        self.show_distance_axis.setChecked(True)
+        self.show_distance_axis.toggled.connect(self.refresh_plots)
+
+        self.er_eff = QDoubleSpinBox()
+        self.er_eff.setRange(1.0, 20.0)
+        self.er_eff.setDecimals(3)
+        self.er_eff.setValue(4.0)
+        self.er_eff.setSingleStep(0.1)
+        self.er_eff.valueChanged.connect(self.refresh_plots)
+
         self.tdr_oversample = QSpinBox()
         self.tdr_oversample.setRange(1, 16)
         self.tdr_oversample.setValue(4)
@@ -224,6 +244,8 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("IL Upper Limit", il_limit_widget)
         settings_layout.addRow("TDR Time Limit", self.tdr_time_limit_ns)
         settings_layout.addRow("Ref. Impedance", self.reference_impedance)
+        settings_layout.addRow("Show Distance", self.show_distance_axis)
+        settings_layout.addRow("Eff. Dk", self.er_eff)
         settings_layout.addRow("TDR Oversample", self.tdr_oversample)
         settings_layout.addRow("Port Pairing", self.port_pairing)
 
@@ -437,6 +459,8 @@ class MainWindow(QMainWindow):
                     freq_ghz[mask],
                     trace_db[mask],
                     label=f"{dataset.display_name}: {trace_name}",
+                    color=dataset.color,
+                    linestyle=trace_linestyle(trace_name),
                     linewidth=2.3 if is_selected else 1.3,
                     alpha=1.0 if is_selected else 0.85,
                 )
@@ -475,6 +499,8 @@ class MainWindow(QMainWindow):
             self.tdr_plot.axes.legend(loc="best")
         self.tdr_plot.axes.set_xlim(left=0.0, right=x_limit)
         self.tdr_plot.axes.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.55)
+        if self.show_distance_axis.isChecked():
+            self._add_tdr_distance_axis()
         if selected_dataset is not None:
             tdr_value = float(
                 np.interp(
@@ -485,6 +511,19 @@ class MainWindow(QMainWindow):
             )
             self.tdr_plot.set_point_marker(min(self._tdr_marker_time_ns, x_limit), tdr_value)
         self.tdr_plot.draw_idle()
+
+    def _add_tdr_distance_axis(self) -> None:
+        er_eff = max(self.er_eff.value(), 1.0)
+        propagation_velocity_mm_per_ns = (SPEED_OF_LIGHT_M_PER_S / np.sqrt(er_eff)) * 1e3 / 1e9
+
+        def time_to_distance_mm(time_ns: float | np.ndarray) -> float | np.ndarray:
+            return np.asarray(time_ns) * propagation_velocity_mm_per_ns / 2.0
+
+        def distance_to_time_ns(distance_mm: float | np.ndarray) -> float | np.ndarray:
+            return np.asarray(distance_mm) * 2.0 / propagation_velocity_mm_per_ns
+
+        secondary_axis = self.tdr_plot.axes.secondary_xaxis("top", functions=(time_to_distance_mm, distance_to_time_ns))
+        secondary_axis.set_xlabel("Distance (mm)")
 
     def refresh_marker_readout(self) -> None:
         dataset = self._selected_dataset()
