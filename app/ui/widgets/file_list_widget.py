@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import QListWidget, QListWidgetItem
 
 
@@ -31,6 +32,14 @@ class FileListWidget(QListWidget):
 
     def clear_files(self) -> None:
         self.clear()
+
+    def paintEvent(self, event) -> None:  # pragma: no cover - Qt hook
+        super().paintEvent(event)
+        if self.count() > 0:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(QColor(150, 150, 150, 180))
+        painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, "Drag and drop s4p file")
 
     def dragEnterEvent(self, event) -> None:  # pragma: no cover - Qt hook
         mime_data = event.mimeData()

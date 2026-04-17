@@ -27,6 +27,7 @@ def summarize_frequency_range(frequency_hz: np.ndarray) -> dict[str, float | int
         "freq_start_ghz": float(frequency_hz[0] / 1e9),
         "freq_stop_ghz": float(frequency_hz[-1] / 1e9),
         "point_count": int(frequency_hz.size),
+        "tdr_rise_time_ps": float(0.35 / frequency_hz[-1] * 1e12),
     }
 
 

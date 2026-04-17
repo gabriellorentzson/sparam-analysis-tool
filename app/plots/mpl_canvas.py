@@ -22,6 +22,7 @@ class PlotCanvas(QWidget):
         self._drag_callback: Callable[[float, float], None] | None = None
         self._hover_callback: Callable[[float | None, float | None], None] | None = None
         self._marker_artists = []
+        self._hover_annotation = None
         self._dragging = False
         self.canvas.mpl_connect("button_press_event", self._on_click)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -44,6 +45,7 @@ class PlotCanvas(QWidget):
     def clear(self) -> None:
         self.axes.clear()
         self._marker_artists = []
+        self._hover_annotation = None
 
     def reset_labels(self, title: str, x_label: str, y_label: str) -> None:
         self.axes.set_title(title)
@@ -58,6 +60,39 @@ class PlotCanvas(QWidget):
         for artist in self._marker_artists:
             artist.remove()
         self._marker_artists = []
+
+    def set_hover_annotation(self, x_value: float, y_value: float, text: str) -> None:
+        x_limits = self.axes.get_xlim()
+        y_limits = self.axes.get_ylim()
+        x_midpoint = (x_limits[0] + x_limits[1]) / 2.0
+        y_midpoint = (y_limits[0] + y_limits[1]) / 2.0
+        x_offset = -12 if x_value >= x_midpoint else 12
+        y_offset = -12 if y_value >= y_midpoint else 12
+
+        if self._hover_annotation is None:
+            self._hover_annotation = self.axes.annotate(
+                text,
+                xy=(x_value, y_value),
+                xytext=(x_offset, y_offset),
+                textcoords="offset points",
+                bbox={"boxstyle": "round,pad=0.3", "fc": "#1f1f1f", "ec": "#c0c0c0", "alpha": 0.9},
+                color="white",
+                fontsize=8,
+                zorder=6,
+                annotation_clip=True,
+            )
+            self._hover_annotation.set_in_layout(False)
+        else:
+            self._hover_annotation.xy = (x_value, y_value)
+            self._hover_annotation.set_position((x_offset, y_offset))
+            self._hover_annotation.set_text(text)
+            self._hover_annotation.set_visible(True)
+        self.canvas.draw_idle()
+
+    def clear_hover_annotation(self) -> None:
+        if self._hover_annotation is not None:
+            self._hover_annotation.set_visible(False)
+            self.canvas.draw_idle()
 
     def set_point_marker(self, x_value: float, y_value: float) -> None:
         self.clear_markers()

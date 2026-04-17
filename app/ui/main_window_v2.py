@@ -6,7 +6,7 @@ from types import ModuleType
 
 import numpy as np
 from PyQt6.QtCore import QObject, QSignalBlocker, QThread, QTimer, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
@@ -15,17 +15,15 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QProgressDialog,
     QPushButton,
-    QScrollArea,
-    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -47,16 +45,29 @@ from app.services.update_checker import (
     prepare_windows_self_update,
 )
 from app.ui.widgets.file_list_widget import FileListWidget
+from app.ui.widgets.collapsible_section import CollapsibleSection
 from app.ui.widgets.marker_readout import MarkerReadoutWidget
 from app.version import __version__
 
 
 PLOT_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b"]
+TRACE_COLORS = [
+    "#e15759",
+    "#76b7b2",
+    "#59a14f",
+    "#edc948",
+    "#b07aa1",
+    "#f28e2b",
+    "#4e79a7",
+    "#9c755f",
+]
 MIXED_MODE_INDEX_LABELS = ("1", "2")
 MIXED_MODE_FAMILIES = ("SDD", "SDC", "SCD", "SCC")
 DEFAULT_TRACE = "SDD21"
 TRACE_LINESTYLES = ["-", "--", "-.", ":"]
 SPEED_OF_LIGHT_M_PER_S = 299_792_458.0
+INTERNAL_TDR_OVERSAMPLE = 4
+FAVORITE_TRACE_NAMES = ["SDD21", "S21", "S12"]
 
 
 def single_ended_trace_names() -> list[str]:
@@ -75,6 +86,7 @@ def mixed_mode_trace_names() -> list[str]:
 ALL_TRACE_NAMES = single_ended_trace_names() + mixed_mode_trace_names()
 
 _SPARAM_LOADER_MODULE: ModuleType | None = None
+_DEEMBED_MODULE: ModuleType | None = None
 _TDR_MODULE: ModuleType | None = None
 
 
@@ -85,7 +97,14 @@ def load_touchstone_dataset_lazy(file_path: str) -> LoadedDataset:
     return _SPARAM_LOADER_MODULE.load_touchstone_dataset(file_path=file_path)
 
 
-def compute_differential_tdr_lazy(*, frequency_hz, sdd11, reference_impedance_ohms, oversample):
+def compute_differential_tdr_with_rise_time_lazy(
+    *,
+    frequency_hz,
+    sdd11,
+    reference_impedance_ohms,
+    oversample,
+    rise_time_ps,
+):
     global _TDR_MODULE
     if _TDR_MODULE is None:
         _TDR_MODULE = importlib.import_module("app.analysis.tdr")
@@ -94,6 +113,38 @@ def compute_differential_tdr_lazy(*, frequency_hz, sdd11, reference_impedance_oh
         sdd11=sdd11,
         reference_impedance_ohms=reference_impedance_ohms,
         oversample=oversample,
+        rise_time_ps=rise_time_ps,
+    )
+
+
+def minimum_supported_rise_time_ps_lazy(frequency_hz):
+    global _TDR_MODULE
+    if _TDR_MODULE is None:
+        _TDR_MODULE = importlib.import_module("app.analysis.tdr")
+    return _TDR_MODULE.minimum_supported_rise_time_ps(frequency_hz)
+
+
+def dataset_from_network_lazy(network, *, file_path: str, display_name: str, source_note: str = "") -> LoadedDataset:
+    global _SPARAM_LOADER_MODULE
+    if _SPARAM_LOADER_MODULE is None:
+        _SPARAM_LOADER_MODULE = importlib.import_module("app.analysis.sparam_loader")
+    return _SPARAM_LOADER_MODULE.dataset_from_network(
+        network,
+        file_path=file_path,
+        display_name=display_name,
+        source_note=source_note,
+    )
+
+
+def deembed_datasets_lazy(dut_dataset, *, left_dataset=None, right_dataset=None, mode: str = "left"):
+    global _DEEMBED_MODULE
+    if _DEEMBED_MODULE is None:
+        _DEEMBED_MODULE = importlib.import_module("app.analysis.deembedding")
+    return _DEEMBED_MODULE.deembed_datasets(
+        dut_dataset,
+        left_dataset=left_dataset,
+        right_dataset=right_dataset,
+        mode=mode,
     )
 
 
@@ -102,6 +153,13 @@ def trace_linestyle(trace_name: str) -> str:
         return "-"
     style_index = sum(ord(character) for character in trace_name) % len(TRACE_LINESTYLES)
     return TRACE_LINESTYLES[style_index]
+
+
+def trace_color(trace_name: str, dataset_color: str) -> str:
+    if trace_name == "SDD21":
+        return dataset_color
+    color_index = sum(ord(character) for character in trace_name) % len(TRACE_COLORS)
+    return TRACE_COLORS[color_index]
 
 
 class UpdateInstallWorker(QObject):
@@ -121,6 +179,17 @@ class UpdateInstallWorker(QObject):
         self.finished.emit(prepared_update)
 
 
+class NumericTableWidgetItem(QTableWidgetItem):
+    def __init__(self, value: float, display_text: str) -> None:
+        super().__init__(display_text)
+        self.numeric_value = value
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, NumericTableWidgetItem):
+            return self.numeric_value < other.numeric_value
+        return super().__lt__(other)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -130,6 +199,7 @@ class MainWindow(QMainWindow):
         self.datasets: dict[str, LoadedDataset] = {}
         self.trace_checkboxes: dict[str, QCheckBox] = {}
         self._next_color_index = 0
+        self._derived_dataset_counter = 0
         self._frequency_marker_ghz = 13.28
         self._tdr_marker_time_ns = 0.0
         self._update_thread: QThread | None = None
@@ -143,7 +213,7 @@ class MainWindow(QMainWindow):
         self.file_list.itemSelectionChanged.connect(self._on_selected_file_changed)
         self.file_list.files_dropped.connect(self.load_files_from_paths)
 
-        self.summary_table = QTableWidget(0, 6)
+        self.summary_table = QTableWidget(0, 7)
         self.marker_readout = MarkerReadoutWidget()
         self.marker_readout.frequency_input.valueChanged.connect(self._on_manual_marker_frequency_changed)
         self.il_plot = PlotCanvas("Frequency-Domain Plot", "Frequency (GHz)", "Magnitude (dB)")
@@ -152,6 +222,11 @@ class MainWindow(QMainWindow):
         self.il_plot.set_drag_callback(self._handle_il_marker)
         self.il_plot.set_hover_callback(self._handle_il_hover)
         self.tdr_plot.set_click_callback(self._handle_tdr_marker)
+        self.tdr_plot.set_hover_callback(self._handle_tdr_hover)
+        self.il_plot.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tdr_plot.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.il_plot.customContextMenuRequested.connect(lambda pos: self._show_plot_visibility_menu(self.il_plot, pos))
+        self.tdr_plot.customContextMenuRequested.connect(lambda pos: self._show_plot_visibility_menu(self.tdr_plot, pos))
 
         self.freq_limit_ghz = QDoubleSpinBox()
         self.freq_limit_ghz.setRange(1.0, 1000.0)
@@ -175,6 +250,13 @@ class MainWindow(QMainWindow):
         self.reference_impedance.setValue(100.0)
         self.reference_impedance.setSuffix(" Ohm")
 
+        self.tdr_rise_time_ps = QDoubleSpinBox()
+        self.tdr_rise_time_ps.setRange(1.0, 1000.0)
+        self.tdr_rise_time_ps.setDecimals(1)
+        self.tdr_rise_time_ps.setValue(20.0)
+        self.tdr_rise_time_ps.setSuffix(" ps")
+        self.tdr_rise_time_ps.valueChanged.connect(self._on_tdr_rise_time_changed)
+
         self.show_distance_axis = QCheckBox("Show distance axis")
         self.show_distance_axis.setChecked(True)
         self.show_distance_axis.toggled.connect(self.refresh_plots)
@@ -186,19 +268,29 @@ class MainWindow(QMainWindow):
         self.er_eff.setSingleStep(0.1)
         self.er_eff.valueChanged.connect(self.refresh_plots)
 
-        self.tdr_oversample = QSpinBox()
-        self.tdr_oversample.setRange(1, 16)
-        self.tdr_oversample.setValue(4)
-
         self.port_pairing = QComboBox()
         self.port_pairing.addItems(PAIRING_OPTIONS.keys())
         self.port_pairing.setCurrentText("Ports (1,3) / (2,4)")
         self.port_pairing.currentIndexChanged.connect(self._rebuild_derived_data)
 
-        self.hover_readout_label = QLabel("Hover: -")
+        self.deembed_dut = QComboBox()
+        self.deembed_left = QComboBox()
+        self.deembed_right = QComboBox()
+        self.deembed_mode = QComboBox()
+        self.deembed_mode.addItem("Remove Left Fixture", "left")
+        self.deembed_mode.addItem("Remove Right Fixture", "right")
+        self.deembed_mode.addItem("Remove Both Sides (Same Fixture)", "both_same")
+        self.deembed_mode.addItem("Remove Both Sides (Separate Fixtures)", "both_separate")
+        self.deembed_mode.currentIndexChanged.connect(self._update_deembed_control_state)
+        self.create_deembedded_button = QPushButton("Create De-Embedded Result")
+        self.create_deembedded_button.clicked.connect(self.create_deembedded_dataset)
+
+        self.sidebar_toggle_button = QPushButton("Hide Sidebar")
+        self.sidebar_toggle_button.clicked.connect(self._toggle_sidebar)
         self.status_label = QLabel("Ready.")
         self._build_ui()
         self._configure_summary_table()
+        self._refresh_deembed_selectors()
         self.marker_readout.set_frequency_value(self._frequency_marker_ghz)
 
         QTimer.singleShot(1200, lambda: self.check_for_updates(silent_if_current=True))
@@ -206,12 +298,18 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         root_layout = QVBoxLayout(central)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_left_panel())
-        splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([430, 1170])
-        root_layout.addWidget(splitter, stretch=1)
-        root_layout.addWidget(self._build_summary_group())
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(self.sidebar_toggle_button)
+        top_bar.addStretch(1)
+        root_layout.addLayout(top_bar)
+
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.sidebar_widget = self._build_left_panel()
+        self.main_splitter.addWidget(self.sidebar_widget)
+        self.main_splitter.addWidget(self._build_right_panel())
+        self.main_splitter.setSizes([430, 1170])
+        root_layout.addWidget(self.main_splitter, stretch=1)
+        root_layout.addWidget(self._build_bottom_panel())
         root_layout.addWidget(self.status_label)
         self.setCentralWidget(central)
 
@@ -219,8 +317,10 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        files_group = QGroupBox("Loaded Files")
-        files_layout = QVBoxLayout(files_group)
+        files_section = CollapsibleSection("Loaded Files", expanded=True)
+        files_container = QWidget()
+        files_layout = QVBoxLayout(files_container)
+        files_layout.setContentsMargins(0, 0, 0, 0)
         files_layout.addWidget(self.file_list)
         button_row = QHBoxLayout()
         load_button = QPushButton("Load .s4p Files")
@@ -233,9 +333,11 @@ class MainWindow(QMainWindow):
         button_row.addWidget(remove_button)
         button_row.addWidget(clear_button)
         files_layout.addLayout(button_row)
+        files_section.add_widget(files_container)
 
-        settings_group = QGroupBox("Analysis Controls")
-        settings_layout = QFormLayout(settings_group)
+        settings_section = CollapsibleSection("Analysis Controls", expanded=False)
+        settings_widget = QWidget()
+        settings_layout = QFormLayout(settings_widget)
         il_limit_widget = QWidget()
         il_limit_layout = QHBoxLayout(il_limit_widget)
         il_limit_layout.setContentsMargins(0, 0, 0, 0)
@@ -244,17 +346,28 @@ class MainWindow(QMainWindow):
         settings_layout.addRow("IL Upper Limit", il_limit_widget)
         settings_layout.addRow("TDR Time Limit", self.tdr_time_limit_ns)
         settings_layout.addRow("Ref. Impedance", self.reference_impedance)
+        settings_layout.addRow("TDR Rise Time", self.tdr_rise_time_ps)
         settings_layout.addRow("Show Distance", self.show_distance_axis)
         settings_layout.addRow("Eff. Dk", self.er_eff)
-        settings_layout.addRow("TDR Oversample", self.tdr_oversample)
         settings_layout.addRow("Port Pairing", self.port_pairing)
+        settings_section.add_widget(settings_widget)
 
-        traces_group = QGroupBox("Frequency Traces")
-        traces_layout = QVBoxLayout(traces_group)
-        traces_layout.addWidget(self._build_trace_selector())
+        traces_section = CollapsibleSection("Frequency Traces", expanded=False)
+        traces_section.add_widget(self._build_trace_selector())
 
-        action_group = QGroupBox("Actions")
-        action_layout = QGridLayout(action_group)
+        deembed_section = CollapsibleSection("De-Embedding", expanded=False)
+        deembed_widget = QWidget()
+        deembed_layout = QFormLayout(deembed_widget)
+        deembed_layout.addRow("DUT", self.deembed_dut)
+        deembed_layout.addRow("Left Fixture", self.deembed_left)
+        deembed_layout.addRow("Right Fixture", self.deembed_right)
+        deembed_layout.addRow("Mode", self.deembed_mode)
+        deembed_layout.addRow(self.create_deembedded_button)
+        deembed_section.add_widget(deembed_widget)
+
+        action_section = CollapsibleSection("Actions", expanded=False)
+        action_widget = QWidget()
+        action_layout = QGridLayout(action_widget)
         recalc_button = QPushButton("Recompute TDR")
         update_button = QPushButton("Check for Updates")
         refresh_button = QPushButton("Refresh Plots")
@@ -264,30 +377,46 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(recalc_button, 0, 0)
         action_layout.addWidget(update_button, 0, 1)
         action_layout.addWidget(refresh_button, 1, 0, 1, 2)
+        action_section.add_widget(action_widget)
 
-        layout.addWidget(files_group, stretch=1)
-        layout.addWidget(settings_group)
-        layout.addWidget(traces_group, stretch=1)
-        layout.addWidget(self.marker_readout, stretch=1)
-        layout.addWidget(self.hover_readout_label)
-        layout.addWidget(action_group)
+        layout.addWidget(files_section)
+        layout.addWidget(settings_section)
+        layout.addWidget(traces_section)
+        layout.addWidget(deembed_section)
+        layout.addWidget(action_section)
+        layout.addStretch(1)
         return widget
 
     def _build_trace_selector(self) -> QWidget:
         container = QWidget()
-        grid = QGridLayout(container)
-        grid.setContentsMargins(6, 6, 6, 6)
-        for index, trace_name in enumerate(ALL_TRACE_NAMES):
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        favorites_widget = QWidget()
+        favorites_grid = QGridLayout(favorites_widget)
+        favorites_grid.setContentsMargins(6, 6, 6, 6)
+        for index, trace_name in enumerate(FAVORITE_TRACE_NAMES):
             checkbox = QCheckBox(trace_name)
             checkbox.setChecked(trace_name == DEFAULT_TRACE)
             checkbox.toggled.connect(self._on_trace_selection_changed)
-            grid.addWidget(checkbox, index // 4, index % 4)
+            favorites_grid.addWidget(checkbox, 0, index)
             self.trace_checkboxes[trace_name] = checkbox
+        layout.addWidget(favorites_widget)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(container)
-        return scroll
+        advanced_section = CollapsibleSection("More Traces", expanded=False)
+        advanced_widget = QWidget()
+        advanced_grid = QGridLayout(advanced_widget)
+        advanced_grid.setContentsMargins(6, 6, 6, 6)
+        remaining_traces = [trace_name for trace_name in ALL_TRACE_NAMES if trace_name not in FAVORITE_TRACE_NAMES]
+        for index, trace_name in enumerate(remaining_traces):
+            checkbox = QCheckBox(trace_name)
+            checkbox.setChecked(False)
+            checkbox.toggled.connect(self._on_trace_selection_changed)
+            advanced_grid.addWidget(checkbox, index // 4, index % 4)
+            self.trace_checkboxes[trace_name] = checkbox
+        advanced_section.add_widget(advanced_widget)
+        layout.addWidget(advanced_section)
+        return container
 
     def _build_right_panel(self) -> QWidget:
         widget = QWidget()
@@ -296,19 +425,65 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tdr_plot, stretch=1)
         return widget
 
-    def _build_summary_group(self) -> QWidget:
-        group = QGroupBox("Summary")
-        layout = QVBoxLayout(group)
-        layout.addWidget(self.summary_table)
-        return group
+    def _show_plot_visibility_menu(self, source_widget: QWidget, position) -> None:
+        menu = QMenu(self)
+
+        show_frequency_action = QAction("Show Frequency Plot", self)
+        show_frequency_action.setCheckable(True)
+        show_frequency_action.setChecked(self.il_plot.isVisible())
+
+        show_tdr_action = QAction("Show TDR Plot", self)
+        show_tdr_action.setCheckable(True)
+        show_tdr_action.setChecked(self.tdr_plot.isVisible())
+
+        toggle_sidebar_action = QAction("Hide Sidebar" if self.sidebar_widget.isVisible() else "Show Sidebar", self)
+
+        menu.addAction(show_frequency_action)
+        menu.addAction(show_tdr_action)
+        menu.addSeparator()
+        menu.addAction(toggle_sidebar_action)
+
+        selected_action = menu.exec(source_widget.mapToGlobal(position))
+        if selected_action is None:
+            return
+        if selected_action == toggle_sidebar_action:
+            self._toggle_sidebar()
+            return
+
+        new_show_frequency = show_frequency_action.isChecked()
+        new_show_tdr = show_tdr_action.isChecked()
+        if not new_show_frequency and not new_show_tdr:
+            QMessageBox.information(self, "Plot Visibility", "At least one plot must remain visible.")
+            return
+
+        self.il_plot.setVisible(new_show_frequency)
+        self.tdr_plot.setVisible(new_show_tdr)
+        self.status_label.setText(
+            "Showing "
+            + ("frequency and TDR plots" if new_show_frequency and new_show_tdr else "frequency plot" if new_show_frequency else "TDR plot")
+            + "."
+        )
+
+    def _build_bottom_panel(self) -> QWidget:
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        summary_section = CollapsibleSection("Summary")
+        summary_section.add_widget(self.summary_table)
+        marker_section = CollapsibleSection("Marker Readout")
+        marker_section.add_widget(self.marker_readout)
+        layout.addWidget(summary_section, stretch=3)
+        layout.addWidget(marker_section, stretch=2)
+        return widget
 
     def _configure_summary_table(self) -> None:
+        self.summary_table.setSortingEnabled(True)
         self.summary_table.setHorizontalHeaderLabels(
             [
                 "Filename",
                 "Start (GHz)",
                 "Stop (GHz)",
                 "Points",
+                "TDR Rise (ps)",
                 "SDD21 @ 13.28 GHz (dB)",
                 "SDD21 @ 26.5625 GHz (dB)",
             ]
@@ -348,6 +523,7 @@ class MainWindow(QMainWindow):
 
         if loaded_count == 0:
             return
+        self._refresh_deembed_selectors()
         self._rebuild_derived_data()
         self._apply_frequency_limit_from_file()
         if self.file_list.currentItem() is None and self.file_list.count() > 0:
@@ -361,6 +537,7 @@ class MainWindow(QMainWindow):
         for file_path in selected_paths:
             self.datasets.pop(file_path, None)
             self.file_list.remove_file(file_path)
+        self._refresh_deembed_selectors()
         self._apply_frequency_limit_from_file()
         self.refresh_all_views()
         self.status_label.setText(f"Removed {len(selected_paths)} file(s).")
@@ -368,10 +545,11 @@ class MainWindow(QMainWindow):
     def clear_files(self) -> None:
         self.datasets.clear()
         self.file_list.clear_files()
+        self._refresh_deembed_selectors()
         self.marker_readout.set_active_file(None)
         self.marker_readout.update_rows([])
         self.freq_limit_ghz.setValue(30.0)
-        self.hover_readout_label.setText("Hover: -")
+        self.il_plot.clear_hover_annotation()
         self.refresh_all_views()
         self.status_label.setText("Cleared all files.")
 
@@ -387,18 +565,19 @@ class MainWindow(QMainWindow):
             mixed_mode = single_ended_to_mixed_mode(dataset.raw_s_parameters, port_order=port_order)
             sdd11 = mixed_mode[:, 0, 0]
             sdd21 = mixed_mode[:, 1, 0]
-            tdr_result = compute_differential_tdr_lazy(
+            tdr_result = compute_differential_tdr_with_rise_time_lazy(
                 frequency_hz=dataset.frequency_hz,
                 sdd11=sdd11,
                 reference_impedance_ohms=self.reference_impedance.value(),
-                oversample=self.tdr_oversample.value(),
+                oversample=INTERNAL_TDR_OVERSAMPLE,
+                rise_time_ps=self.tdr_rise_time_ps.value(),
             )
             dataset.mixed_mode_s_parameters = mixed_mode
             dataset.tdr_time_ns = tdr_result.time_ns
             dataset.tdr_impedance_ohms = tdr_result.impedance_ohms
             dataset.metrics = build_summary_metrics(dataset.display_name, dataset.frequency_hz, sdd21)
         self.refresh_all_views()
-        self.status_label.setText("Updated derived traces for current pairing.")
+        self._update_tdr_rise_time_status()
 
     def _apply_frequency_limit_from_file(self) -> None:
         if not self.datasets:
@@ -413,26 +592,135 @@ class MainWindow(QMainWindow):
         self.freq_limit_ghz.blockSignals(False)
         self.refresh_plots()
 
+    def _toggle_sidebar(self) -> None:
+        is_hidden = self.sidebar_widget.isHidden()
+        self.sidebar_widget.setVisible(is_hidden)
+        self.sidebar_toggle_button.setText("Hide Sidebar" if is_hidden else "Show Sidebar")
+
+    def _on_tdr_rise_time_changed(self) -> None:
+        self._rebuild_derived_data()
+
+    def _update_tdr_rise_time_status(self) -> None:
+        if not self.datasets:
+            self.status_label.setText("Ready.")
+            return
+        requested_rise_time_ps = self.tdr_rise_time_ps.value()
+        min_supported_ps = max(minimum_supported_rise_time_ps_lazy(dataset.frequency_hz) for dataset in self.datasets.values())
+        effective_rise_time_ps = max(requested_rise_time_ps, min_supported_ps)
+        if effective_rise_time_ps > requested_rise_time_ps:
+            self.status_label.setText(
+                f"TDR rise time limited by bandwidth to {effective_rise_time_ps:.1f} ps."
+            )
+            return
+        self.status_label.setText(f"TDR rise time set to {effective_rise_time_ps:.1f} ps.")
+
     def refresh_all_views(self) -> None:
         self.refresh_summary_table()
         self.refresh_plots()
         self.refresh_marker_readout()
 
+    def _refresh_deembed_selectors(self) -> None:
+        combos = [self.deembed_dut, self.deembed_left, self.deembed_right]
+        current_values = [combo.currentData() for combo in combos]
+        choices = list(self.datasets.items())
+
+        for combo, previous in zip(combos, current_values):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(None)", "")
+            for key, dataset in choices:
+                combo.addItem(dataset.display_name, key)
+            index = combo.findData(previous)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.blockSignals(False)
+        self._update_deembed_control_state()
+
+    def _update_deembed_control_state(self) -> None:
+        mode = self.deembed_mode.currentData()
+        if mode is None:
+            mode = "left"
+        self.deembed_left.setEnabled(mode in {"left", "both_same", "both_separate"})
+        self.deembed_right.setEnabled(mode in {"right", "both_separate"})
+
+    def create_deembedded_dataset(self) -> None:
+        dut_key = self.deembed_dut.currentData()
+        left_key = self.deembed_left.currentData()
+        right_key = self.deembed_right.currentData()
+        mode = self.deembed_mode.currentData() or "left"
+
+        dut_dataset = self.datasets.get(dut_key or "")
+        left_dataset = self.datasets.get(left_key or "") if left_key else None
+        right_dataset = self.datasets.get(right_key or "") if right_key else None
+
+        if dut_dataset is None:
+            QMessageBox.warning(self, "De-Embedding", "Select a DUT dataset first.")
+            return
+
+        try:
+            result_network = deembed_datasets_lazy(
+                dut_dataset,
+                left_dataset=left_dataset,
+                right_dataset=right_dataset,
+                mode=mode,
+            )
+        except Exception as exc:  # pragma: no cover
+            QMessageBox.warning(self, "De-Embedding", f"Could not create de-embedded result:\n{exc}")
+            return
+
+        self._derived_dataset_counter += 1
+        derived_key = f"derived://deembed/{self._derived_dataset_counter}"
+        derived_label = f"{dut_dataset.display_name} [deembedded]"
+        derived_dataset = dataset_from_network_lazy(
+            result_network,
+            file_path=derived_key,
+            display_name=derived_label,
+            source_note=f"De-embedded from {dut_dataset.display_name}",
+        )
+        derived_dataset.color = PLOT_COLORS[self._next_color_index % len(PLOT_COLORS)]
+        self._next_color_index += 1
+        self.datasets[derived_key] = derived_dataset
+        with QSignalBlocker(self.file_list):
+            self.file_list.add_file(derived_key, derived_label, checked=True)
+        self._refresh_deembed_selectors()
+        self._rebuild_derived_data()
+        self.status_label.setText(f"Created de-embedded result for {dut_dataset.display_name}.")
+
     def refresh_summary_table(self) -> None:
+        sorting_enabled = self.summary_table.isSortingEnabled()
+        self.summary_table.setSortingEnabled(False)
         self.summary_table.setRowCount(0)
         for row_index, dataset in enumerate(self.datasets.values()):
             self.summary_table.insertRow(row_index)
             metrics = dataset.metrics
-            values = [
-                metrics.get("filename", dataset.display_name),
-                self._format_metric(metrics.get("freq_start_ghz", float("nan"))),
-                self._format_metric(metrics.get("freq_stop_ghz", float("nan"))),
-                str(metrics.get("point_count", "")),
-                self._format_metric(metrics.get("sdd21_db_13p28_ghz", float("nan"))),
-                self._format_metric(metrics.get("sdd21_db_26p5625_ghz", float("nan"))),
-            ]
-            for column_index, value in enumerate(values):
-                self.summary_table.setItem(row_index, column_index, QTableWidgetItem(value))
+            self.summary_table.setItem(row_index, 0, QTableWidgetItem(str(metrics.get("filename", dataset.display_name))))
+            self.summary_table.setItem(
+                row_index,
+                1,
+                self._create_numeric_item(metrics.get("freq_start_ghz", float("nan"))),
+            )
+            self.summary_table.setItem(
+                row_index,
+                2,
+                self._create_numeric_item(metrics.get("freq_stop_ghz", float("nan"))),
+            )
+            point_count = float(metrics.get("point_count", float("nan")))
+            self.summary_table.setItem(row_index, 3, NumericTableWidgetItem(point_count, str(metrics.get("point_count", ""))))
+            self.summary_table.setItem(
+                row_index,
+                4,
+                self._create_numeric_item(metrics.get("tdr_rise_time_ps", float("nan"))),
+            )
+            self.summary_table.setItem(
+                row_index,
+                5,
+                self._create_numeric_item(metrics.get("sdd21_db_13p28_ghz", float("nan"))),
+            )
+            self.summary_table.setItem(
+                row_index,
+                6,
+                self._create_numeric_item(metrics.get("sdd21_db_26p5625_ghz", float("nan"))),
+            )
+        self.summary_table.setSortingEnabled(sorting_enabled)
 
     def refresh_plots(self) -> None:
         self._plot_frequency_traces()
@@ -459,7 +747,7 @@ class MainWindow(QMainWindow):
                     freq_ghz[mask],
                     trace_db[mask],
                     label=f"{dataset.display_name}: {trace_name}",
-                    color=dataset.color,
+                    color=trace_color(trace_name, dataset.color),
                     linestyle=trace_linestyle(trace_name),
                     linewidth=2.3 if is_selected else 1.3,
                     alpha=1.0 if is_selected else 0.85,
@@ -526,22 +814,25 @@ class MainWindow(QMainWindow):
         secondary_axis.set_xlabel("Distance (mm)")
 
     def refresh_marker_readout(self) -> None:
-        dataset = self._selected_dataset()
-        self.marker_readout.set_active_file(dataset.display_name if dataset else None)
-        if dataset is None:
+        selected_dataset = self._selected_dataset()
+        self.marker_readout.set_active_file(selected_dataset.display_name if selected_dataset else "All visible traces/files")
+        if not self.datasets:
             self.marker_readout.update_rows([])
             return
         rows: list[FrequencyMarkerRow] = []
-        for trace_name in self.selected_trace_names():
-            trace_db = magnitude_db(self._trace_values(dataset, trace_name))
-            value = np.interp(self._frequency_marker_ghz * 1e9, dataset.frequency_hz, trace_db)
-            rows.append(
-                FrequencyMarkerRow(
-                    trace_name=trace_name,
-                    frequency_ghz=self._frequency_marker_ghz,
-                    magnitude_db=float(value),
+        for dataset in self.datasets.values():
+            if not dataset.enabled:
+                continue
+            for trace_name in self.selected_trace_names():
+                trace_db = magnitude_db(self._trace_values(dataset, trace_name))
+                value = np.interp(self._frequency_marker_ghz * 1e9, dataset.frequency_hz, trace_db)
+                rows.append(
+                    FrequencyMarkerRow(
+                        trace_name=f"{dataset.display_name}: {trace_name}",
+                        frequency_ghz=self._frequency_marker_ghz,
+                        magnitude_db=float(value),
+                    )
                 )
-            )
         self.marker_readout.update_rows(rows)
 
     def selected_trace_names(self) -> list[str]:
@@ -564,6 +855,27 @@ class MainWindow(QMainWindow):
         if current_item is None:
             return None
         return self.datasets.get(current_item.data(Qt.ItemDataRole.UserRole))
+
+    def _hover_sample_for_selected_dataset(self, x_value_ghz: float) -> tuple[float, float, str] | None:
+        dataset = self._selected_dataset()
+        if dataset is None:
+            return None
+
+        trace_names = self.selected_trace_names()
+        if not trace_names:
+            return None
+
+        freq_ghz = dataset.frequency_hz / 1e9
+        best_sample: tuple[float, float, str] | None = None
+        best_distance = float("inf")
+        for trace_name in trace_names:
+            trace_db = magnitude_db(self._trace_values(dataset, trace_name))
+            index = int(np.argmin(np.abs(freq_ghz - x_value_ghz)))
+            distance = abs(float(freq_ghz[index]) - x_value_ghz)
+            if distance < best_distance:
+                best_distance = distance
+                best_sample = (float(freq_ghz[index]), float(trace_db[index]), trace_name)
+        return best_sample
 
     def _on_selected_file_changed(self) -> None:
         self.refresh_marker_readout()
@@ -597,23 +909,43 @@ class MainWindow(QMainWindow):
         self.refresh_plots()
 
     def _handle_il_hover(self, x_value: float | None, _y_value: float | None) -> None:
+        if x_value is None:
+            self.il_plot.clear_hover_annotation()
+            return
+        sample = self._hover_sample_for_selected_dataset(max(0.0, x_value))
+        if sample is None:
+            self.il_plot.clear_hover_annotation()
+            return
+        frequency_ghz, magnitude_db_value, trace_name = sample
+        self.il_plot.set_hover_annotation(
+            frequency_ghz,
+            magnitude_db_value,
+            f"{trace_name}\n{frequency_ghz:.4f} GHz\n{magnitude_db_value:.2f} dB",
+        )
+
+    def _handle_tdr_hover(self, x_value: float | None, _y_value: float | None) -> None:
+        if x_value is None:
+            self.tdr_plot.clear_hover_annotation()
+            return
+
         dataset = self._selected_dataset()
-        if dataset is None or x_value is None:
-            self.hover_readout_label.setText("Hover: -")
+        if dataset is None or not dataset.enabled:
+            self.tdr_plot.clear_hover_annotation()
             return
 
-        trace_names = self.selected_trace_names()
-        if not trace_names:
-            self.hover_readout_label.setText("Hover: no traces selected")
+        time_ns = dataset.tdr_time_ns
+        if time_ns.size == 0:
+            self.tdr_plot.clear_hover_annotation()
             return
 
-        frequency_ghz = max(0.0, x_value)
-        parts = []
-        for trace_name in trace_names:
-            trace_db = magnitude_db(self._trace_values(dataset, trace_name))
-            value = float(np.interp(frequency_ghz * 1e9, dataset.frequency_hz, trace_db))
-            parts.append(f"{trace_name} {value:.2f} dB")
-        self.hover_readout_label.setText(f"Hover @ {frequency_ghz:.4f} GHz: " + " | ".join(parts))
+        index = int(np.argmin(np.abs(time_ns - x_value)))
+        sample_time_ns = float(time_ns[index])
+        sample_impedance = float(dataset.tdr_impedance_ohms[index])
+        self.tdr_plot.set_hover_annotation(
+            sample_time_ns,
+            sample_impedance,
+            f"{dataset.display_name}\n{sample_time_ns:.4f} ns\n{sample_impedance:.2f} Ohm",
+        )
 
     def _format_metric(self, value: float | int | str) -> str:
         if isinstance(value, float):
@@ -621,6 +953,10 @@ class MainWindow(QMainWindow):
                 return "N/A"
             return f"{value:.3f}"
         return str(value)
+
+    def _create_numeric_item(self, value: float | int | str) -> QTableWidgetItem:
+        numeric_value = float(value) if isinstance(value, (int, float)) else float("nan")
+        return NumericTableWidgetItem(numeric_value, self._format_metric(value))
 
     def check_for_updates(self, silent_if_current: bool) -> None:
         try:

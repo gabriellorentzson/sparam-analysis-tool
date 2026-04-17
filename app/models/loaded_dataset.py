@@ -28,8 +28,10 @@ class LoadedDataset:
     enabled: bool
     frequency_hz: np.ndarray
     raw_s_parameters: np.ndarray
+    raw_z0: np.ndarray
     mixed_mode_s_parameters: np.ndarray
     tdr_time_ns: np.ndarray
     tdr_impedance_ohms: np.ndarray
     metrics: dict[str, float | int | str]
     color: str = field(default="")
+    source_note: str = field(default="")

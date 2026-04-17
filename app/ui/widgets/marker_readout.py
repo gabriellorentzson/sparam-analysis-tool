@@ -4,7 +4,6 @@ from collections.abc import Sequence
 
 from PyQt6.QtWidgets import (
     QDoubleSpinBox,
-    QGroupBox,
     QHeaderView,
     QLabel,
     QTableWidget,
@@ -16,9 +15,9 @@ from PyQt6.QtWidgets import (
 from app.models.loaded_dataset import FrequencyMarkerRow
 
 
-class MarkerReadoutWidget(QGroupBox):
+class MarkerReadoutWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Marker Readout", parent)
+        super().__init__(parent)
         self.active_file_label = QLabel("No file selected")
         self.frequency_input = QDoubleSpinBox()
         self.frequency_input.setRange(0.0, 200.0)
