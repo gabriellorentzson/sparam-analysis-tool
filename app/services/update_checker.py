@@ -35,7 +35,9 @@ class PreparedUpdate:
     script_path: str
     source_dir: str
     target_dir: str
-    executable_name: str
+    executable_path: str
+    parent_pid: int
+    log_path: str
 
 
 def _normalize_version(version: str) -> tuple[int, ...]:
@@ -109,11 +111,12 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
         raise UpdateInstallError("No downloadable release asset was found for this version.")
 
     install_dir = Path(sys.executable).resolve().parent
-    executable_name = Path(sys.executable).name
+    executable_path = str(Path(sys.executable).resolve())
     staging_root = Path(tempfile.mkdtemp(prefix="sparam_tool_update_"))
     archive_path = staging_root / (update_info.asset_name or "update.zip")
     extracted_dir = staging_root / "extracted"
     extracted_dir.mkdir(parents=True, exist_ok=True)
+    log_path = staging_root / "update.log"
 
     request = Request(
         update_info.asset_download_url,
@@ -137,13 +140,35 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
         param(
             [string]$SourceDir,
             [string]$TargetDir,
-            [string]$ExecutableName
+            [string]$ExecutablePath,
+            [int]$ParentPid,
+            [string]$LogPath
         )
 
-        Start-Sleep -Seconds 2
+        function Write-Log {
+            param([string]$Message)
+            Add-Content -LiteralPath $LogPath -Value ("[{0}] {1}" -f (Get-Date -Format s), $Message)
+        }
+
+        Write-Log "Updater started"
+        Write-Log "SourceDir=$SourceDir"
+        Write-Log "TargetDir=$TargetDir"
+        Write-Log "ExecutablePath=$ExecutablePath"
+        Write-Log "ParentPid=$ParentPid"
+
+        for ($attempt = 0; $attempt -lt 30; $attempt++) {
+            $proc = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+            if ($null -eq $proc) {
+                Write-Log "Parent process exited"
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+
         $copied = $false
         for ($attempt = 0; $attempt -lt 15; $attempt++) {
             & robocopy $SourceDir $TargetDir /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+            Write-Log ("Robocopy exit code: {0}" -f $LASTEXITCODE)
             if ($LASTEXITCODE -lt 8) {
                 $copied = $true
                 break
@@ -152,11 +177,18 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
         }
 
         if (-not $copied) {
+            Write-Log "Copy failed after retries"
             exit 1
         }
 
         Start-Sleep -Seconds 1
-        Start-Process -FilePath (Join-Path $TargetDir $ExecutableName)
+        if (-not (Test-Path -LiteralPath $ExecutablePath)) {
+            Write-Log "Executable not found after copy"
+            exit 1
+        }
+
+        Write-Log "Launching updated executable"
+        Start-Process -FilePath $ExecutablePath -WorkingDirectory $TargetDir
         """
     ).strip()
     script_path.write_text(script_contents, encoding="utf-8")
@@ -171,7 +203,9 @@ def prepare_windows_self_update(update_info: UpdateInfo, timeout_seconds: float 
         script_path=str(script_path),
         source_dir=str(extracted_dir),
         target_dir=str(install_dir),
-        executable_name=executable_name,
+        executable_path=executable_path,
+        parent_pid=os.getpid(),
+        log_path=str(log_path),
     )
 
 
@@ -193,7 +227,9 @@ def launch_prepared_update(prepared_update: PreparedUpdate) -> None:
                 prepared_update.script_path,
                 prepared_update.source_dir,
                 prepared_update.target_dir,
-                prepared_update.executable_name,
+                prepared_update.executable_path,
+                str(prepared_update.parent_pid),
+                prepared_update.log_path,
             ],
             creationflags=creation_flags,
         )
